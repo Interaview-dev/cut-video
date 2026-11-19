@@ -28,6 +28,7 @@ class SplitRequest(BaseModel):
     video_url: str
     threshold: float = 27.0   # plus bas = plus sensible
     min_scene_len: int = 15   # en images
+    reencode: bool = False    # False = découpe sans ré-encodage (rapide, léger, coupes sur images clés)
 
 
 def check_key(key: str):
@@ -99,10 +100,16 @@ def split(req: SplitRequest, x_api_key: str = Header(default="")):
             name = f"plan_{i:03d}.mp4"
             s, e = start.get_seconds(), end.get_seconds()
             try:
+                if req.reencode:
+                    # coupes précises, mais plus lourd (1 thread pour limiter la mémoire)
+                    codec = ["-c:v", "libx264", "-preset", "ultrafast", "-threads", "1",
+                             "-c:a", "aac"]
+                else:
+                    codec = ["-c", "copy", "-avoid_negative_ts", "make_zero"]
                 subprocess.run(
-                    ["ffmpeg", "-y", "-ss", f"{s:.3f}", "-i", str(src),
-                     "-t", f"{e - s:.3f}", "-c:v", "libx264", "-preset", "veryfast",
-                     "-c:a", "aac", str(job_dir / name)],
+                    ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+                     "-ss", f"{s:.3f}", "-i", str(src), "-t", f"{e - s:.3f}",
+                     *codec, str(job_dir / name)],
                     check=True, capture_output=True, text=True,
                 )
             except FileNotFoundError:
@@ -111,7 +118,9 @@ def split(req: SplitRequest, x_api_key: str = Header(default="")):
                 log.error(err.stderr)
                 raise HTTPException(
                     status_code=500,
-                    detail=f"FFmpeg a échoué sur le plan {i} : {(err.stderr or '')[-500:]}",
+                    detail=f"FFmpeg a échoué sur le plan {i} (code {err.returncode}"
+                           f"{', processus tué : mémoire insuffisante ?' if err.returncode in (-9, 137) else ''}) : "
+                           f"{(err.stderr or '')[-500:]}",
                 )
             results.append({
                 "plan": i,
