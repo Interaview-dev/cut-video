@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import traceback
 import uuid
+import zipfile
 from pathlib import Path
 
 import requests
@@ -131,7 +132,19 @@ def split(req: SplitRequest, x_api_key: str = Header(default="")):
             })
 
         src.unlink(missing_ok=True)  # on garde seulement les plans
-        return {"job_id": job_id, "nb_plans": len(results), "plans": results}
+
+        # 4. Archive ZIP de tous les plans (pas de compression : les vidéos le sont déjà)
+        zip_path = job_dir / "plans.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as z:
+            for mp4 in sorted(job_dir.glob("plan_*.mp4")):
+                z.write(mp4, arcname=mp4.name)
+
+        return {
+            "job_id": job_id,
+            "nb_plans": len(results),
+            "zip_url": f"{BASE_URL}/files/{job_id}/plans.zip",
+            "plans": results,
+        }
 
     except HTTPException:
         shutil.rmtree(job_dir, ignore_errors=True)
