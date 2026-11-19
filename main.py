@@ -1,6 +1,8 @@
+import logging
 import os
 import shutil
 import subprocess
+import traceback
 import uuid
 from pathlib import Path
 
@@ -10,8 +12,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from scenedetect import ContentDetector, detect
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("scene-splitter")
+
 API_KEY = os.environ.get("API_KEY", "")
-BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")  # ex: https://mon-service.onrender.com
+BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")  # ex: https://mon-service.up.railway.app
 DATA = Path(os.environ.get("DATA_DIR", "/tmp/data"))
 DATA.mkdir(parents=True, exist_ok=True)
 
@@ -27,7 +32,12 @@ class SplitRequest(BaseModel):
 
 def check_key(key: str):
     if API_KEY and key != API_KEY:
-        raise HTTPException(status_code=401, detail="Clé API invalide")
+        raise HTTPException(status_code=401, detail="Clé API invalide (en-tête x-api-key)")
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "docs": "/docs"}
 
 
 @app.post("/split")
@@ -38,42 +48,89 @@ def split(req: SplitRequest, x_api_key: str = Header(default="")):
     job_dir.mkdir()
     src = job_dir / "source.mp4"
 
-    # 1. Téléchargement
-    with requests.get(req.video_url, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        with open(src, "wb") as f:
-            for chunk in r.iter_content(1024 * 1024):
-                f.write(chunk)
+    try:
+        # 1. Téléchargement
+        try:
+            with requests.get(req.video_url, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                ctype = r.headers.get("content-type", "").lower()
+                if "text/html" in ctype:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="L'URL renvoie une page web, pas une vidéo. "
+                               "Utilise un lien direct vers le fichier (ex. .mp4).",
+                    )
+                with open(src, "wb") as f:
+                    for chunk in r.iter_content(1024 * 1024):
+                        f.write(chunk)
+        except requests.exceptions.RequestException as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Téléchargement impossible : {type(e).__name__}: {e}",
+            )
 
-    # 2. Détection des plans
-    scenes = detect(
-        str(src),
-        ContentDetector(threshold=req.threshold, min_scene_len=req.min_scene_len),
-    )
-    if not scenes:  # aucun changement détecté : la vidéo entière est un seul plan
-        raise HTTPException(status_code=422, detail="Aucun plan détecté")
+        if not src.exists() or src.stat().st_size == 0:
+            raise HTTPException(status_code=400, detail="Le fichier téléchargé est vide.")
 
-    # 3. Découpe (ré-encodage pour des coupes précises à l'image)
-    results = []
-    for i, (start, end) in enumerate(scenes, start=1):
-        name = f"plan_{i:03d}.mp4"
-        s, e = start.get_seconds(), end.get_seconds()
-        subprocess.run(
-            ["ffmpeg", "-y", "-ss", f"{s:.3f}", "-i", str(src),
-             "-t", f"{e - s:.3f}", "-c:v", "libx264", "-preset", "veryfast",
-             "-c:a", "aac", str(job_dir / name)],
-            check=True, capture_output=True,
-        )
-        results.append({
-            "plan": i,
-            "debut": start.get_timecode(),
-            "fin": end.get_timecode(),
-            "duree_s": round(e - s, 3),
-            "url": f"{BASE_URL}/files/{job_id}/{name}",
-        })
+        # 2. Détection des plans
+        try:
+            scenes = detect(
+                str(src),
+                ContentDetector(threshold=req.threshold, min_scene_len=req.min_scene_len),
+            )
+        except Exception as e:
+            log.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=422,
+                detail=f"Impossible d'analyser la vidéo (format non lisible ?) : "
+                       f"{type(e).__name__}: {e}",
+            )
 
-    src.unlink()  # on garde seulement les plans
-    return {"job_id": job_id, "nb_plans": len(results), "plans": results}
+        if not scenes:
+            raise HTTPException(
+                status_code=422,
+                detail="Aucun changement de plan détecté. Essaie de baisser 'threshold' "
+                       "(ex. 20), ou la vidéo ne contient qu'un seul plan.",
+            )
+
+        # 3. Découpe (ré-encodage pour des coupes précises à l'image)
+        results = []
+        for i, (start, end) in enumerate(scenes, start=1):
+            name = f"plan_{i:03d}.mp4"
+            s, e = start.get_seconds(), end.get_seconds()
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-ss", f"{s:.3f}", "-i", str(src),
+                     "-t", f"{e - s:.3f}", "-c:v", "libx264", "-preset", "veryfast",
+                     "-c:a", "aac", str(job_dir / name)],
+                    check=True, capture_output=True, text=True,
+                )
+            except FileNotFoundError:
+                raise HTTPException(status_code=500, detail="FFmpeg n'est pas installé dans le conteneur.")
+            except subprocess.CalledProcessError as err:
+                log.error(err.stderr)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"FFmpeg a échoué sur le plan {i} : {(err.stderr or '')[-500:]}",
+                )
+            results.append({
+                "plan": i,
+                "debut": start.get_timecode(),
+                "fin": end.get_timecode(),
+                "duree_s": round(e - s, 3),
+                "url": f"{BASE_URL}/files/{job_id}/{name}",
+            })
+
+        src.unlink(missing_ok=True)  # on garde seulement les plans
+        return {"job_id": job_id, "nb_plans": len(results), "plans": results}
+
+    except HTTPException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    except Exception as e:
+        log.error(traceback.format_exc())
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Erreur inattendue : {type(e).__name__}: {e}")
 
 
 @app.delete("/jobs/{job_id}")
