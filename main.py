@@ -2,6 +2,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import traceback
 import uuid
 import zipfile
@@ -30,6 +31,16 @@ class SplitRequest(BaseModel):
     threshold: float = 27.0   # plus bas = plus sensible
     min_scene_len: int = 15   # en images
     reencode: bool = False    # False = découpe sans ré-encodage (rapide, léger, coupes sur images clés)
+    run_id: str = ""          # identifiant fourni par l'appelant, permet d'interrompre avec /cancel/{run_id}
+
+
+# Traitements en cours : run_id -> {"cancel": Event, "proc": processus FFmpeg en cours}
+JOBS = {}
+
+
+def check_cancelled(job):
+    if job and job["cancel"].is_set():
+        raise HTTPException(status_code=409, detail="Découpage interrompu par l'utilisateur.")
 
 
 def check_key(key: str):
@@ -50,6 +61,11 @@ def split(req: SplitRequest, x_api_key: str = Header(default="")):
     job_dir.mkdir()
     src = job_dir / "source.mp4"
 
+    job = None
+    if req.run_id:
+        job = {"cancel": threading.Event(), "proc": None}
+        JOBS[req.run_id] = job
+
     try:
         # 1. Téléchargement
         try:
@@ -64,6 +80,7 @@ def split(req: SplitRequest, x_api_key: str = Header(default="")):
                     )
                 with open(src, "wb") as f:
                     for chunk in r.iter_content(1024 * 1024):
+                        check_cancelled(job)
                         f.write(chunk)
         except requests.exceptions.RequestException as e:
             raise HTTPException(
@@ -74,7 +91,9 @@ def split(req: SplitRequest, x_api_key: str = Header(default="")):
         if not src.exists() or src.stat().st_size == 0:
             raise HTTPException(status_code=400, detail="Le fichier téléchargé est vide.")
 
-        # 2. Détection des plans
+        check_cancelled(job)
+
+        # 2. Détection des plans (ne peut pas être coupée en plein calcul : l'arrêt a lieu juste après)
         try:
             scenes = detect(
                 str(src),
@@ -88,6 +107,8 @@ def split(req: SplitRequest, x_api_key: str = Header(default="")):
                        f"{type(e).__name__}: {e}",
             )
 
+        check_cancelled(job)
+
         if not scenes:
             raise HTTPException(
                 status_code=422,
@@ -98,6 +119,7 @@ def split(req: SplitRequest, x_api_key: str = Header(default="")):
         # 3. Découpe (ré-encodage pour des coupes précises à l'image)
         results = []
         for i, (start, end) in enumerate(scenes, start=1):
+            check_cancelled(job)
             name = f"plan_{i:03d}.mp4"
             s, e = start.get_seconds(), end.get_seconds()
             try:
@@ -107,12 +129,20 @@ def split(req: SplitRequest, x_api_key: str = Header(default="")):
                              "-c:a", "aac"]
                 else:
                     codec = ["-c", "copy", "-avoid_negative_ts", "make_zero"]
-                subprocess.run(
+                proc = subprocess.Popen(
                     ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
                      "-ss", f"{s:.3f}", "-i", str(src), "-t", f"{e - s:.3f}",
                      *codec, str(job_dir / name)],
-                    check=True, capture_output=True, text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
+                if job:
+                    job["proc"] = proc
+                _, stderr = proc.communicate()
+                if job:
+                    job["proc"] = None
+                check_cancelled(job)
+                if proc.returncode != 0:
+                    raise subprocess.CalledProcessError(proc.returncode, proc.args, stderr=stderr)
             except FileNotFoundError:
                 raise HTTPException(status_code=500, detail="FFmpeg n'est pas installé dans le conteneur.")
             except subprocess.CalledProcessError as err:
@@ -153,6 +183,22 @@ def split(req: SplitRequest, x_api_key: str = Header(default="")):
         log.error(traceback.format_exc())
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Erreur inattendue : {type(e).__name__}: {e}")
+    finally:
+        if req.run_id:
+            JOBS.pop(req.run_id, None)
+
+
+@app.post("/cancel/{run_id}")
+def cancel(run_id: str, x_api_key: str = Header(default="")):
+    check_key(x_api_key)
+    job = JOBS.get(run_id)
+    if not job:
+        return {"cancelled": False, "detail": "Aucun traitement en cours pour ce run_id."}
+    job["cancel"].set()
+    proc = job.get("proc")
+    if proc and proc.poll() is None:
+        proc.kill()
+    return {"cancelled": True}
 
 
 @app.delete("/jobs/{job_id}")
